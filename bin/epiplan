@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# epiplan: single entry point. Works from anywhere (also through a symlink).
+set -euo pipefail
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"; [[ "$src" != /* ]] && src="$dir/$src"
+done
+HERE="$(cd "$(dirname "$src")/.." && pwd)"
+PY="$HERE/.venv/bin/python"
+[ -x "$PY" ] || { echo "epiplan: run $HERE/install.sh first" >&2; exit 1; }
+
+case "${1:-help}" in
+  login)   exec "$PY" "$HERE/epilogin.py" setup ;;
+  refresh) exec "$PY" "$HERE/epilogin.py" refresh ;;
+  serve)   shift; exec "$PY" "$HERE/server.py" "$@" ;;
+  whoami|list|register) exec "$PY" "$HERE/epiplan.py" "$@" ;;
+  *) cat <<'H'
+epiplan <command>
+
+  login      log in once in a visible browser (saves your Microsoft session)
+  refresh    renew tokens through the saved session (headless)
+  whoami     show the logged-in student
+  list       [--days N] [--open-only]   upcoming activities
+  register   EVENT_ID [--slot ID]       register to an event
+  serve      [--http PORT] [--read-only]   run the MCP server by hand
+H
+  ;;
+esac
