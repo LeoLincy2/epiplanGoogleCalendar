@@ -4,14 +4,21 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/epiplan"
 
-PYBIN=""
-for c in python3.13 python3.12 python3.11 python3.10 python3; do
-  if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then PYBIN="$c"; break; fi
-done
-[ -n "$PYBIN" ] || { echo "Python 3.10+ is required." >&2; exit 1; }
-
 echo "==> virtualenv + dependencies"
-"$PYBIN" -m venv "$HERE/.venv"
+if [ ! -x "$HERE/.venv/bin/pip" ]; then
+  PYBIN=""
+  for c in "${EPIPLAN_PYTHON:-}" python3.13 python3.12 python3.11 python3.10 python3; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null &&
+       "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' &&
+       "$c" -m venv --clear "$HERE/.venv" >/dev/null 2>&1 &&
+       [ -x "$HERE/.venv/bin/pip" ]; then
+      PYBIN="$c"
+      break
+    fi
+  done
+  [ -n "$PYBIN" ] || { echo "Python 3.10+ with venv and pip is required." >&2; exit 1; }
+fi
 "$HERE/.venv/bin/pip" install -q --upgrade pip
 "$HERE/.venv/bin/pip" install -q -r "$HERE/requirements.txt"
 "$HERE/.venv/bin/playwright" install chromium
@@ -26,18 +33,32 @@ ln -sfn "$HERE/bin/epiplan" "$HOME/.local/bin/epiplan"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "    add ~/.local/bin to your PATH";; esac
 
 echo "==> skill"
-mkdir -p "$HOME/.claude/skills"
-ln -sfn "$HERE/skills/planning" "$HOME/.claude/skills/planning"
+if command -v claude >/dev/null; then
+  mkdir -p "$HOME/.claude/skills"
+  ln -sfn "$HERE/skills/planning" "$HOME/.claude/skills/planning"
+fi
+if command -v codex >/dev/null; then
+  CODEX_SKILLS="${CODEX_HOME:-$HOME/.codex}/skills"
+  mkdir -p "$CODEX_SKILLS"
+  ln -sfn "$HERE/skills/planning" "$CODEX_SKILLS/planning"
+fi
 
-echo "==> MCP server"
+echo "==> MCP servers"
 if command -v claude >/dev/null; then
   claude mcp remove epitech-planning --scope user >/dev/null 2>&1 || true
   claude mcp add epitech-planning --scope user \
     -e EPIPLAN_ENABLE_WRITES=1 -e EPIPLAN_MAX_WRITES=5 -e EPIPLAN_MODULE_ALLOWLIST= \
     -- "$HERE/.venv/bin/python" "$HERE/server.py"
-else
+fi
+if command -v codex >/dev/null; then
+  codex mcp remove epitech-planning >/dev/null 2>&1 || true
+  codex mcp add epitech-planning \
+    --env EPIPLAN_ENABLE_WRITES=1 --env EPIPLAN_MAX_WRITES=5 --env EPIPLAN_MODULE_ALLOWLIST= \
+    -- "$HERE/.venv/bin/python" "$HERE/server.py"
+fi
+if ! command -v claude >/dev/null && ! command -v codex >/dev/null; then
   cat <<EOF
-    'claude' not found. Register the server in your MCP client with:
+    No supported CLI found. Register the server in your MCP client with:
       command: $HERE/.venv/bin/python
       args:    ["$HERE/server.py"]
       env:     EPIPLAN_ENABLE_WRITES=1, EPIPLAN_MAX_WRITES=5, EPIPLAN_MODULE_ALLOWLIST=
