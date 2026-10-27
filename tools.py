@@ -257,21 +257,25 @@ def register_event(event_id: int, reason: str, slot_id: int | None = None, allow
         if _dt(ev["endDate"]) <= now or _closes_at(ev) <= now:
             return {"ok": False, "error": f"Registration closed since {_local(_closes_at(ev).isoformat())}."}
         cap = ev.get("maxCapacity")
-        if cap and ev["registrationsCount"] >= cap:
-            return {"ok": False, "error": "Event is full."}
         uses_slots = bool(ev.get("activitySlotsEnabled"))
+        # With slots, capacity is the free slots: registrationsCount also counts people registered without a slot.
+        if not uses_slots and cap and ev["registrationsCount"] >= cap:
+            return {"ok": False, "error": "Event is full."}
         if uses_slots and slot_id is None:
             return {"ok": False, "error": "This activity uses slots: call get_event and pass slot_id."}
         if not uses_slots and slot_id is not None:
             return {"ok": False, "error": "This event has no slots."}
-        if c.call("GET", f"/events/{event_id}/registrations/me"):
-            return {"ok": False, "error": "Already registered."}
         if uses_slots:
-            slot = next((s for s in c.call("GET", f"/events/{event_id}/slots") if s["id"] == slot_id), None)
+            slots = c.call("GET", f"/events/{event_id}/slots")
+            if any(_slim_slot(s, c.login)["mine"] for s in slots):
+                return {"ok": False, "error": "Already have a slot on this event."}
+            slot = next((s for s in slots if s["id"] == slot_id), None)
             if slot is None or slot.get("registration"):
                 return {"ok": False, "error": "Slot does not exist or is taken."}
             start, end = _dt(slot["startDate"]), _dt(slot["endDate"])
         else:
+            if c.call("GET", f"/events/{event_id}/registrations/me"):
+                return {"ok": False, "error": "Already registered."}
             start, end = _dt(ev["startDate"]), _dt(ev["endDate"])
         if not allow_overlap:
             mine = _my_event_ids(_api(start - timedelta(days=1)), _api(end + timedelta(days=1)))
