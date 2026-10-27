@@ -58,7 +58,7 @@ Check what's open, get a clear report, register to activities and modules — wi
 
 ## Install
 
-Needs Python 3.10+ and an MCP-capable agent (the installer registers itself automatically if it finds the `claude` command; otherwise it prints what to add by hand).
+Needs Python 3.10+ and an MCP-capable agent. The installer registers itself automatically with the `claude` and `codex` CLIs when they are available; otherwise it prints what to add by hand.
 
 ```bash
 git clone https://github.com/daniilsys/epiplan.git
@@ -79,8 +79,8 @@ Then edit `~/.config/epiplan/rules.md` with your preferences, restart your agent
 | virtualenv | `.venv/` with `playwright` and `mcp`, plus Chromium |
 | command | `~/.local/bin/epiplan` (symlink) |
 | config | `~/.config/epiplan/` (private, mode 700), with `rules.md` from the template |
-| skill | `skills/planning` linked into `~/.claude/skills/` |
-| MCP server | `epitech-planning`, user scope, absolute paths, so it works from any folder |
+| skill | `skills/planning` linked into the detected clients' skill directories (`~/.claude/skills/` and/or `~/.codex/skills/`, or `$CODEX_HOME/skills/` if set) |
+| MCP server | `epitech-planning` registered with the detected clients, using absolute paths so it works from any folder |
 
 Nothing is installed system-wide. Remove the symlinks, the MCP entry and the folder to uninstall.
 
