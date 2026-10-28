@@ -122,15 +122,17 @@ Dates are `Europe/Paris`; a bare date means that day at midnight. There is delib
 
 ## Google Calendar
 
-`epiplan calendar sync` copies the activities you are registered to into your Google Calendar. Nothing else is sent. Re-running it updates the same events, and events you unregister from are removed on the next sync (only events created by epiplan are ever deleted). It is read-only on the Epitech side.
+`epiplan gcal sync` copies the activities you are registered to into your Google Calendar. For slot-based activities, only the slot you booked is copied. Re-running it updates the same events, and events you unregister from are removed on the next sync (only events created by epiplan are ever deleted). It is read-only on the Epitech side.
+
+The MCP server also exposes Google Calendar tools: `google_calendar_status`, `list_google_calendars`, `google_schedule` and `check_availability` (read), and `sync_google_calendar_event` and `create_google_external_event` (write, dry run by default, no Epitech write). Conflicts are checked against both your Epitech slots and your Google events.
 
 One-time setup:
 
 1. In Google Cloud Console, create a project, enable the **Google Calendar API**, and create an OAuth client of type **Desktop app**.
 2. Save its JSON as `~/.config/epiplan/google_client_secret.json`.
-3. Run `epiplan calendar login` and approve in the browser.
+3. Run `epiplan gcal login` and approve in the browser. If you logged in before this version, run it again: the calendar read scope was added.
 
-Then `epiplan calendar sync [--days 30] [--calendar primary] [--no-prune]`.
+Then `epiplan gcal sync [--days 30] [--calendar primary] [--no-prune]`, or `epiplan gcal status` to check the connection.
 
 ## Safety
 

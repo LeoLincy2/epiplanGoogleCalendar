@@ -16,7 +16,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from googleapiclient.errors import HttpError
+
+import google_calendar as gcal
 from client import ApiError, AuthError, Client
+from google_calendar import CalendarError
 
 TZ = ZoneInfo("Europe/Paris")
 MAX_WINDOW_DAYS = 44  # API limit is 45
@@ -221,22 +225,25 @@ def _audit(entry):
         f.write(json.dumps({"at": datetime.now(TZ).isoformat(timespec="seconds"), **entry}, ensure_ascii=False) + "\n")
 
 
-def _guarded_write(action, target, reason, dry_run, plan, do):
-    """Shared tail of every write: dry run, kill switch, budget, audit, API error mapping."""
+def _guarded_write(action, target, reason, dry_run, plan, do, cost=1):
+    """Shared tail of every write: dry run, kill switch, budget, audit, API error mapping.
+    `cost` counts against EPIPLAN_MAX_WRITES: Google Calendar writes pass cost=0, only Epitech writes are budgeted."""
     global _writes_done
+    if not reason.strip():
+        return {"ok": False, "error": "A non-empty reason is required."}
     if dry_run:
         _audit({"action": action, "target": target, "reason": reason, "dry_run": True})
         return {"ok": True, "dry_run": True, "would": plan}
     if os.environ.get("EPIPLAN_ENABLE_WRITES") != "1":
         return {"ok": False, "error": "Writes are disabled (set EPIPLAN_ENABLE_WRITES=1 on the server)."}
-    if _writes_done >= int(os.environ.get("EPIPLAN_MAX_WRITES", "5")):
+    if _writes_done + cost > int(os.environ.get("EPIPLAN_MAX_WRITES", "5")):
         return {"ok": False, "error": "Write budget for this run exhausted."}
     try:
         result = do()
-    except (ApiError, AuthError) as e:
+    except (ApiError, AuthError, CalendarError, HttpError) as e:
         _audit({"action": action, "target": target, "reason": reason, "ok": False, "error": str(e)[:200]})
         return _error(e)
-    _writes_done += 1
+    _writes_done += cost
     _audit({"action": action, "target": target, "reason": reason, "ok": True})
     return {"ok": True, "done": plan}
 
@@ -332,5 +339,196 @@ def register_module(unit_instance_id: int, reason: str, dry_run: bool = True) ->
         return _error(e)
 
 
-READ_TOOLS = [get_profile, list_modules, list_events, my_schedule, get_event]
-WRITE_TOOLS = [register_event, unregister_event, register_module]
+# ---------- Google Calendar (add-on) ----------
+
+_FAILURES = (ApiError, AuthError, CalendarError, HttpError, ValueError)
+
+
+def _epitech_bookings(start, end):
+    """My bookings in a range, with the booked slot's time rather than the parent activity's window."""
+    c, result, seen = client(), [], set()
+    cur, stop = gcal.bounds(start, end)
+    while cur < stop:
+        nxt = min(cur + timedelta(days=MAX_WINDOW_DAYS), stop)
+        raw = c.call("GET", "/events", params={"startDate": _api(cur), "endDate": _api(nxt),
+                     "registered": "me", "cursus": c.profile["cursus"], "semester": c.profile["semester"]})
+        for ev in raw:
+            if ev["id"] in seen:
+                continue
+            seen.add(ev["id"])
+            slots = [None]
+            if ev.get("activitySlotsEnabled"):
+                slots = [s for s in c.call("GET", f"/events/{ev['id']}/slots") if _slim_slot(s, c.login)["mine"]]
+                if not slots:
+                    raise CalendarError("A registered Epitech activity has no readable booked slot. Cannot verify availability.")
+            for slot in slots:
+                s, e = (slot or ev)["startDate"], (slot or ev)["endDate"]
+                if _dt(s) >= stop or _dt(e) <= _dt(start):
+                    continue
+                result.append({"id": ev["id"], "title": ev.get("fullTitle") or ev.get("title") or ev.get("activityName") or "Epitech",
+                               "start": _local(s), "end": _local(e), "source": "epitech", "busy": True,
+                               "marker": gcal.marker(ev["id"], c.login)})
+        cur = nxt
+    return sorted(result, key=lambda e: _dt(e["start"]))
+
+
+def _epitech_conflicts(start, end, exclude_event_id=None):
+    s, e = gcal.bounds(start, end)
+    return [ev for ev in _epitech_bookings(start, end) if ev["id"] != exclude_event_id
+            and _dt(ev["start"]) < e and _dt(ev["end"]) > s]
+
+
+def _both_conflicts(start, end, exclude_event_id=None, exclude_marker=None):
+    """Conflicts with registered Epitech slots and, when connected, Google Calendar events.
+    A Google copy of an Epitech activity is not a conflict with that same activity."""
+    school = _epitech_conflicts(start, end, exclude_event_id)
+    mirrors = {e["marker"] for e in school}
+    google = gcal.conflicts(start, end, exclude_marker=exclude_marker) if gcal.enabled() else []
+    return school + [e for e in google if e.get("marker") not in mirrors]
+
+
+def _chosen_slot(ev, event_id, slot_id):
+    """The slot to copy: the one I hold, or the one given. None for activities without slots."""
+    if not ev.get("activitySlotsEnabled"):
+        if slot_id is not None:
+            raise CalendarError("This activity has no slots.")
+        return None
+    c = client()
+    slots = c.call("GET", f"/events/{event_id}/slots")
+    mine = [s for s in slots if _slim_slot(s, c.login)["mine"]]
+    if slot_id is None and len(mine) == 1:
+        slot = mine[0]
+    elif slot_id is not None:
+        slot = next((s for s in slots if s["id"] == slot_id), None)
+    else:
+        slot = None
+    if slot is None:
+        raise CalendarError("Choose an existing activity slot before copying it to Google Calendar.")
+    if _slim_slot(slot, c.login)["taken"] and not _slim_slot(slot, c.login)["mine"]:
+        raise CalendarError("This slot is booked by someone else.")
+    return slot
+
+
+def _gcal_event_plan(ev, slot=None):
+    chosen = slot or ev
+    rooms = chosen.get("rooms") or ev.get("rooms") or []
+    location = ", ".join(dict.fromkeys(r["name"].strip() for r in rooms
+                                     if isinstance(r, dict) and isinstance(r.get("name"), str) and r["name"].strip()))
+    return {"location": location, "title": ev.get("fullTitle") or ev.get("activityName") or ev.get("title") or "Epitech",
+            "start": _local(chosen["startDate"]), "end": _local(chosen["endDate"]),
+            "marker": gcal.marker(ev["id"], client().login),
+            "notes": "Activité Epitech sélectionnée dans epiplan. https://my.epitech.eu"}
+
+
+def google_calendar_status() -> dict:
+    """Google Calendar connection state: logged in, default calendar, auto-sync. Never opens a login window."""
+    try:
+        return gcal.status()
+    except _FAILURES as exc:
+        return _error(exc)
+
+
+def list_google_calendars() -> list[dict]:
+    """Google calendars on this account, their names and whether they are writable."""
+    try:
+        return gcal.calendars()
+    except _FAILURES as exc:
+        return [_error(exc)]
+
+
+def google_schedule(start: str, end: str) -> dict:
+    """Registered Epitech slots AND Google Calendar events; epiplan copies are deduplicated.
+    Only reports the Google side as checked when Google Calendar is connected."""
+    try:
+        school = _epitech_bookings(start, end)
+        mirrors = {e["marker"] for e in school}
+        sources, personal = ["epitech"], []
+        if gcal.enabled():
+            sources.append("google_calendar")
+            personal = [e for e in gcal.events(start, end) if e.get("marker") not in mirrors]
+        return {"events": sorted(school + personal, key=lambda e: _dt(e["start"])), "sources_checked": sources}
+    except _FAILURES as exc:
+        return _error(exc)
+
+
+def check_availability(start: str, end: str) -> dict:
+    """Check a proposed time against registered Epitech slots and, when connected, Google Calendar."""
+    try:
+        conflicts = _both_conflicts(start, end)
+    except _FAILURES as exc:
+        return _error(exc)
+    sources = ["epitech"] + (["google_calendar"] if gcal.enabled() else [])
+    return {"available": not conflicts, "conflicts": conflicts, "sources_checked": sources}
+
+
+def sync_google_calendar_event(event_id: int, reason: str, slot_id: int | None = None,
+                               calendar_id: str | None = None, allow_overlap: bool = False,
+                               dry_run: bool = True, reminder_minutes: list[int] | None = None) -> dict:
+    """Copy a registered Epitech activity (its booked slot if slot-based) into Google Calendar, without registering.
+    Idempotent per school event: repeating it updates the same copy. Checks conflicts with Epitech and Google.
+    reminder_minutes: reminders in minutes before the start (e.g. [60, 10]); [] clears them, omitted keeps them."""
+    try:
+        alarms = gcal.reminders(reminder_minutes)
+        if not gcal.enabled():
+            raise CalendarError("Connect Google Calendar first: run epiplan gcal login in a terminal.")
+        ev = _find_event(event_id)
+        if ev is None:
+            raise CalendarError("Epitech activity not found in your planning.")
+        plan = _gcal_event_plan(ev, _chosen_slot(ev, event_id, slot_id))
+        target = calendar_id or gcal.load_config()["calendar_id"]
+        cal = next((c for c in gcal.calendars() if c["id"] == target), None)
+        if cal is None or not cal["writable"]:
+            raise CalendarError("Choose an available writable Google calendar.")
+        conflicts = _both_conflicts(plan["start"], plan["end"], event_id, plan["marker"])
+        if conflicts and not allow_overlap:
+            return {"ok": False, "error": "Calendar copy overlaps an existing activity.", "conflicts": conflicts}
+        plan = {**plan, "calendar": cal["title"], "reminder_minutes": alarms}
+        return _guarded_write("sync_google_calendar_event", plan["marker"], reason, dry_run, plan,
+                              lambda: gcal.upsert(title=plan["title"], start=plan["start"], end=plan["end"],
+                                                  marker=plan["marker"], calendar_id=target,
+                                                  location=plan["location"], notes=plan["notes"], alarms=alarms),
+                              cost=0)
+    except _FAILURES as exc:
+        return _error(exc)
+
+
+def create_google_external_event(title: str, start: str, end: str, reason: str,
+                                 calendar_id: str | None = None, location: str = "", notes: str = "",
+                                 all_day: bool = False, allow_overlap: bool = False, dry_run: bool = True,
+                                 reminder_minutes: list[int] | None = None) -> dict:
+    """Add a personal, non-Epitech event to Google Calendar after checking Epitech and Google schedules.
+    Never writes to Epitech. Repeating the same title, time and calendar updates the same event.
+    reminder_minutes: reminders in minutes before the start (e.g. [30]); [] clears them."""
+    try:
+        alarms = gcal.reminders(reminder_minutes)
+        s, e = gcal.bounds(start, end)
+        if not title.strip():
+            raise CalendarError("An event title is required.")
+        if all_day and (s.timetz().replace(tzinfo=None) != datetime.min.time()
+                        or e.timetz().replace(tzinfo=None) != datetime.min.time()):
+            raise CalendarError("All-day events must start and end at midnight; the end date is exclusive.")
+        if not gcal.enabled():
+            raise CalendarError("Connect Google Calendar first: run epiplan gcal login in a terminal.")
+        target = calendar_id or gcal.load_config()["calendar_id"]
+        tag = gcal.external_marker(title, start, end, target)
+        conflicts = _both_conflicts(start, end, exclude_marker=tag)
+        if conflicts and not allow_overlap:
+            return {"ok": False, "error": "Personal event overlaps an existing activity.", "conflicts": conflicts}
+        cal = next((c for c in gcal.calendars() if c["id"] == target), None)
+        if cal is None or not cal["writable"]:
+            raise CalendarError("Choose an available writable Google calendar.")
+        plan = {"title": title.strip(), "start": s.isoformat(), "end": e.isoformat(),
+                "calendar": cal["title"], "all_day": all_day, "reminder_minutes": alarms}
+        return _guarded_write("create_google_external_event", tag, reason, dry_run, plan,
+                              lambda: gcal.upsert(title=title.strip(), start=start, end=end, marker=tag,
+                                                  calendar_id=target, location=location, notes=notes,
+                                                  all_day=all_day, alarms=alarms),
+                              cost=0)
+    except _FAILURES as exc:
+        return _error(exc)
+
+
+READ_TOOLS = [get_profile, list_modules, list_events, my_schedule, get_event,
+              google_calendar_status, list_google_calendars, google_schedule, check_availability]
+WRITE_TOOLS = [register_event, unregister_event, register_module,
+               sync_google_calendar_event, create_google_external_event]
