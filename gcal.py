@@ -51,14 +51,19 @@ def load_credentials():
     return creds
 
 
+def _rfc3339(s):
+    """Google needs full RFC 3339 datetimes with seconds; tools.my_schedule gives e.g. 2026-11-02T09:00+01:00."""
+    return datetime.fromisoformat(s).isoformat(timespec="seconds")
+
+
 def to_gcal(ev):
     """One of my activities (tools.my_schedule item) as a Google Calendar event, same id on every sync."""
     return {
         "id": f"{MARK}{ev['id']}",
         "summary": ev["title"],
         "description": ev["module"]["name"] or "",
-        "start": {"dateTime": ev["start"], "timeZone": "Europe/Paris"},
-        "end": {"dateTime": ev["end"], "timeZone": "Europe/Paris"},
+        "start": {"dateTime": _rfc3339(ev["start"]), "timeZone": "Europe/Paris"},
+        "end": {"dateTime": _rfc3339(ev["end"]), "timeZone": "Europe/Paris"},
         "extendedProperties": {"private": {MARK: "1"}},
     }
 
